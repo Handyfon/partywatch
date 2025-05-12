@@ -2,6 +2,9 @@
 
 A customizable, free, system-agnostic real-time party health overlay for Foundry Virtual Tabletop.
 
+![GitHub issues](https://img.shields.io/github/issues/Handyfon/partywatch?style=for-the-badge)
+[![Forge Installs](https://img.shields.io/badge/dynamic/json?label=Forge%20Installs&query=package.installs&suffix=%25&url=https%3A%2F%2Fforge-vtt.com%2Fapi%2Fbazaar%2Fpackage%2Fpartywatch&colorB=006400&style=for-the-badge)](https://forge-vtt.com/bazaar#package=partywatch) 
+
 ![partywatch](https://github.com/user-attachments/assets/395b2cef-d9d4-4104-ba0f-afcca2ce94ab)
 <br>
 ![partywatch2](https://github.com/user-attachments/assets/76762fee-f1e2-46f5-b50f-d3bc3a556ecc)
