@@ -1,3 +1,10 @@
+const partywatchGetProperty = (object, path) => {
+  if (!object || !path) return undefined;
+  const getPropertyFn = foundry?.utils?.getProperty || globalThis.getProperty;
+  if (getPropertyFn) return getPropertyFn(object, path);
+  return String(path).split(".").reduce((value, key) => value?.[key], object);
+};
+
 Hooks.once('init', () => {
   console.log("PartyWatch | Registering settings...");
 
@@ -571,8 +578,8 @@ async function refreshPartyWatch() {
 
 
 function getHPPercent(actor) {
-  const hp = getProperty(actor.system, "attributes.hp.value") ?? getProperty(actor.system, "wounds.value") ?? 0;
-  const maxHp = getProperty(actor.system, "attributes.hp.max") ?? getProperty(actor.system, "wounds.max") ?? 1;
+  const hp = partywatchGetProperty(actor.system, "attributes.hp.value") ?? partywatchGetProperty(actor.system, "wounds.value") ?? 0;
+  const maxHp = partywatchGetProperty(actor.system, "attributes.hp.max") ?? partywatchGetProperty(actor.system, "wounds.max") ?? 1;
   if (!maxHp || maxHp <= 0) return 0;
   return Math.clamped(Math.floor((hp / maxHp) * 100), 0, 100);
 }
@@ -696,8 +703,8 @@ function getBarPercent(actor) {
 
 
 function getActorHp(actor) {
-  const hp = getProperty(actor, game.settings.get('partywatch', 'hpPath')) ?? 0;
-  const max = getProperty(actor, game.settings.get('partywatch', 'maxhpPath')) ?? 1;
+  const hp = partywatchGetProperty(actor, game.settings.get('partywatch', 'hpPath')) ?? 0;
+  const max = partywatchGetProperty(actor, game.settings.get('partywatch', 'maxhpPath')) ?? 1;
   return { hp, max };
 }
 

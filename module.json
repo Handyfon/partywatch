@@ -2,7 +2,7 @@
   "id": "partywatch",
   "title": "Party Watch",
   "description": "A lightweight HUD showing your party's health, conditions, and status at a glance. Clean, fast, and always ready.",
-  "version": "13.0",
+  "version": "14.1",
   "esmodules": [
     "partywatch.js"
   ],
@@ -22,6 +22,6 @@
   ],
   "compatibility": {
     "minimum": "11",
-    "verified": "13"
+    "verified": "14"
   }
 }
