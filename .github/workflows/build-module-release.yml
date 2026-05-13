@@ -1,0 +1,66 @@
+name: Build Module Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - ".github/workflows/build-module-release.yml"
+      - "module.json"
+      - "partywatch.css"
+      - "partywatch.js"
+      - "README.md"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build zip and GitHub release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Read module version
+        id: version
+        run: |
+          version="$(jq -r '.version' module.json)"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release manifest
+        run: |
+          mkdir -p dist
+          base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${{ steps.version.outputs.version }}"
+          jq \
+            --arg download "${base_url}/partywatch.zip" \
+            '.download = $download' \
+            module.json > dist/module.json
+
+      - name: Build module zip
+        run: |
+          mkdir -p dist/package
+          cp -R \
+            module.json \
+            partywatch.css \
+            partywatch.js \
+            README.md \
+            dist/package/
+          cp dist/module.json dist/package/module.json
+          cd dist/package
+          zip -r ../partywatch.zip .
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Party Watch ${{ steps.version.outputs.version }}
+          files: |
+            dist/module.json
+            dist/partywatch.zip
+          fail_on_unmatched_files: true
+          overwrite_files: true
