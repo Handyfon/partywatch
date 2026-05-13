@@ -26,6 +26,63 @@ Hooks.once('init', () => {
       type: String,
       onChange: () => window.location.reload()
   });
+  game.settings.register('partywatch', 'tempHpPath', {
+      name: 'Temp HP Data Path',
+      hint: 'Path to current temporary HP. Shown as a blue shield overlay on the health bar. (DnD5e default: system.attributes.hp.temp). Leave empty to disable.',
+      scope: 'world',
+      config: true,
+      default: "system.attributes.hp.temp",
+      type: String,
+      onChange: () => refreshPartyWatch()
+  });
+  game.settings.register('partywatch', 'tempMaxHpPath', {
+      name: 'Temp Max HP Data Path',
+      hint: 'Path to temporary max HP — added to max HP for total bar width. (DnD5e default: system.attributes.hp.tempmax). Leave empty to disable.',
+      scope: 'world',
+      config: true,
+      default: "system.attributes.hp.tempmax",
+      type: String,
+      onChange: () => refreshPartyWatch()
+  });
+  game.settings.register('partywatch', 'enableExtraAttributes', {
+      name: 'Enable Extra Attributes',
+      hint: 'Show the configured extra attribute badges/bars under each player entry.',
+      scope: 'world',
+      config: true,
+      default: false,
+      type: Boolean,
+      onChange: () => refreshPartyWatch()
+  });
+  game.settings.register('partywatch', 'extraAttributesGMOnly', {
+      name: 'Extra Attributes — GM Only',
+      hint: 'When on, only the GM sees the extra attributes (players still see HP & temp HP normally).',
+      scope: 'world',
+      config: true,
+      default: false,
+      type: Boolean,
+      onChange: () => refreshPartyWatch()
+  });
+  game.settings.register('partywatch', 'extraAttributes', {
+      name: 'Extra Attributes',
+      hint: 'Additional attribute badges shown under each entry (AC, Passive Perception, mana, etc.). Managed via the "Manage Attributes" button in the in-game settings dialog.',
+      scope: 'world',
+      config: false,
+      default: [
+        { id: 'ac', label: 'AC', currentPath: 'system.attributes.ac.value', maxPath: '', color: '#cbd5e1', type: 'badge', icon: 'shield-halved' },
+        { id: 'pp', label: 'PP', currentPath: 'system.skills.prc.passive', maxPath: '', color: '#a5b4fc', type: 'badge', icon: 'eye' }
+      ],
+      type: Object,
+      onChange: () => refreshPartyWatch()
+  });
+  game.settings.register('partywatch', 'companionActorType', {
+      name: 'Companion Actor Type',
+      hint: 'Actor type used for companions / familiars / summons. If a player owns a token of this type that is currently on the scene, it appears next to their main entry as a smaller card. (DnD5e default: "npc"). Leave empty to disable companions.',
+      scope: 'world',
+      config: true,
+      default: 'npc',
+      type: String,
+      onChange: () => refreshPartyWatch()
+  });
 
 	game.settings.register('partywatch', 'wounds', {
     name: 'Invert HP (More HP BAD)',
@@ -86,14 +143,28 @@ Hooks.once('init', () => {
     onChange: () => refreshPartyWatch()
   });
   
+  game.settings.register('partywatch', 'barPosition', {
+    name: 'Health Bar Position',
+    hint: 'Place the health bar below the portrait, or as a vertical-portrait overlay (the bar sits over the bottom of a taller portrait).',
+    scope: 'client',
+    config: true,
+    choices: {
+      'below':   'Below Portrait',
+      'overlay': 'Overlay on Portrait (vertical)'
+    },
+    default: 'below',
+    type: String,
+    onChange: () => refreshPartyWatch()
+  });
   game.settings.register('partywatch', 'hpColorScheme', {
     name: 'HP Bar Color Scheme',
     hint: 'Change HP bar color dynamically.',
     scope: 'client',
     config: true,
     choices: {
-      'static': 'Static Green',
-      'dynamic': 'Dynamic (Green/Yellow/Red)'
+      'dynamic':   'Dynamic (Red / Yellow / Green)',
+      'static':    'Static Green',
+      'staticRed': 'Static Red'
     },
     default: 'dynamic',
     type: String,
@@ -216,12 +287,178 @@ Hooks.once('init', () => {
     config: false,
     type: Boolean,
     default: true,
-    onChange: visible => {
-      const overlay = document.getElementById('partywatch-overlay');
-      if (overlay) overlay.style.display = visible ? '' : 'none';
+    onChange: () => applyOverlayVisibility()
+  });
+  game.settings.register('partywatch', 'onlyInScene', {
+    name: 'Only Players In Current Scene',
+    hint: 'Only show party members whose tokens are placed in the currently viewed scene. Combined with "Show Offline Players" to further restrict the list.',
+    scope: 'client',
+    config: true,
+    type: Boolean,
+    default: false,
+    onChange: () => refreshPartyWatch()
+  });
+});
+
+function applyOverlayVisibility() {
+  const overlay = document.getElementById('partywatch-overlay');
+  if (!overlay) return;
+  const visible = game.settings.get('partywatch', 'overlayVisible') ?? true;
+  if (visible) {
+    const layout = game.settings.get('partywatch', 'overlayLayout') || 'flex';
+    overlay.style.display = layout;
+  } else {
+    overlay.style.display = 'none';
+  }
+}
+
+/* ===== GM → ALL PLAYERS SETTING PUSH ====================================
+   Client-scoped settings can't be edited remotely by the GM directly, so the
+   GM broadcasts their current values over a socket and each player applies
+   them locally on their own client.
+   ====================================================================== */
+const PARTYWATCH_CLIENT_KEYS = [
+  'overlayLayout', 'nameDisplay', 'showPortraits', 'scale', 'hpColorScheme',
+  'backgroundOpacity', 'backgroundColor', 'tintMode', 'healthDisplayMode',
+  'portraitSource', 'onlyInScene'
+];
+
+async function pushPartywatchDefaultsToPlayers() {
+  if (!game.user.isGM) return;
+  const payload = {};
+  for (const key of PARTYWATCH_CLIENT_KEYS) {
+    payload[key] = game.settings.get('partywatch', key);
+  }
+  game.socket.emit('module.partywatch', { type: 'applyDefaults', settings: payload });
+  ui.notifications?.info?.('PartyWatch | Pushed view settings to all players.');
+}
+
+/* ===== EXTRA ATTRIBUTES EDITOR =========================================== */
+async function openPartywatchAttributeEditor() {
+  if (!game.user.isGM) {
+    ui.notifications?.warn?.('PartyWatch | Only the GM can edit extra attributes.');
+    return;
+  }
+  let attrs = partywatchGetAttributes().map(a => ({ ...a }));
+  const buildRows = () => attrs.map((a, i) => `
+    <tr data-index="${i}">
+      <td><input type="text" class="pwa-label" value="${(a.label || '').replace(/"/g, '&quot;')}" placeholder="AC"></td>
+      <td><input type="text" class="pwa-path"  value="${(a.currentPath || '').replace(/"/g, '&quot;')}" placeholder="system.attributes.ac.value"></td>
+      <td><input type="text" class="pwa-maxpath" value="${(a.maxPath || '').replace(/"/g, '&quot;')}" placeholder="(optional)"></td>
+      <td><input type="color" class="pwa-color" value="${a.color || '#cbd5e1'}"></td>
+      <td>
+        <select class="pwa-type">
+          <option value="badge"  ${a.type === 'badge'  ? 'selected' : ''}>Badge</option>
+          <option value="number" ${a.type === 'number' ? 'selected' : ''}>Number</option>
+          <option value="bar"    ${a.type === 'bar'    ? 'selected' : ''}>Bar</option>
+        </select>
+      </td>
+      <td><input type="text" class="pwa-icon" value="${(a.icon || '').replace(/"/g, '&quot;')}" placeholder="shield-halved"></td>
+      <td><button type="button" class="pwa-delete" title="Remove">×</button></td>
+    </tr>
+  `).join('');
+
+  const content = `
+    <div class="partywatch-attr-editor">
+      <p class="pwa-hint">Each row adds an extra readout under every player entry. Use data paths the same way as HP (e.g. <code>system.attributes.ac.value</code>). Icons are <a href="https://fontawesome.com/search?ic=free" target="_blank" rel="noopener">FontAwesome</a> names without the <code>fa-</code> prefix — e.g. <code>shield-halved</code>, <code>eye</code>, <code>dragon</code>, <code>flask</code>, <code>microchip</code>.</p>
+      <table class="pwa-table">
+        <thead>
+          <tr>
+            <th>Label</th><th>Path</th><th>Max Path</th><th>Color</th><th>Type</th><th>Icon</th><th></th>
+          </tr>
+        </thead>
+        <tbody class="pwa-rows">${buildRows()}</tbody>
+      </table>
+      <button type="button" class="pwa-add"><i class="fas fa-plus"></i> Add Attribute</button>
+    </div>
+  `;
+
+  const collectFromDOM = (html) => {
+    const out = [];
+    html.find('tr[data-index]').each((_, row) => {
+      const $r = $(row);
+      out.push({
+        id:          out.length + '_' + Date.now().toString(36),
+        label:       $r.find('.pwa-label').val()   || '',
+        currentPath: $r.find('.pwa-path').val()    || '',
+        maxPath:     $r.find('.pwa-maxpath').val() || '',
+        color:       $r.find('.pwa-color').val()   || '#cbd5e1',
+        type:        $r.find('.pwa-type').val()    || 'badge',
+        icon:        $r.find('.pwa-icon').val()    || ''
+      });
+    });
+    return out.filter(a => a.currentPath);
+  };
+
+  const dialog = new Dialog({
+    title: 'PartyWatch — Manage Extra Attributes',
+    content,
+    buttons: {
+      save: {
+        icon: '<i class="fas fa-save"></i>',
+        label: 'Save',
+        callback: html => {
+          const next = collectFromDOM(html);
+          game.settings.set('partywatch', 'extraAttributes', next);
+          refreshPartyWatch();
+        }
+      },
+      reset: {
+        icon: '<i class="fas fa-rotate-left"></i>',
+        label: 'Reset to Defaults',
+        callback: () => {
+          const defaults = [
+            { id: 'ac', label: 'AC', currentPath: 'system.attributes.ac.value', maxPath: '', color: '#cbd5e1', type: 'badge', icon: 'shield-halved' },
+            { id: 'pp', label: 'PP', currentPath: 'system.skills.prc.passive', maxPath: '', color: '#a5b4fc', type: 'badge', icon: 'eye' }
+          ];
+          game.settings.set('partywatch', 'extraAttributes', defaults);
+          refreshPartyWatch();
+        }
+      },
+      cancel: { icon: '<i class="fas fa-times"></i>', label: 'Cancel' }
+    },
+    default: 'save'
+  }, { classes: ['dialog', 'partywatch-dialog', 'partywatch-attr-editor-dialog'], width: 720 });
+
+  dialog.render(true);
+
+  Hooks.once('renderDialog', (app, html) => {
+    const $body = html.find('.pwa-rows');
+    html.find('.pwa-add').on('click', () => {
+      attrs = collectFromDOM(html);
+      attrs.push({ id: 'new_' + Date.now().toString(36), label: '', currentPath: '', maxPath: '', color: '#cbd5e1', type: 'badge', icon: '' });
+      $body.html(buildRows());
+    });
+    $body.on('click', '.pwa-delete', e => {
+      const idx = +$(e.currentTarget).closest('tr').attr('data-index');
+      attrs = collectFromDOM(html);
+      attrs.splice(idx, 1);
+      $body.html(buildRows());
+    });
+  });
+}
+
+async function applyReceivedPartywatchDefaults(settings) {
+  if (!settings || typeof settings !== 'object') return;
+  for (const [key, value] of Object.entries(settings)) {
+    if (!PARTYWATCH_CLIENT_KEYS.includes(key)) continue;
+    try { await game.settings.set('partywatch', key, value); } catch (e) { /* swallow per-key */ }
+  }
+  refreshPartyWatch();
+  updateOverlayLayout();
+  updateOverlayScale();
+  updateOverlayBackground();
+  applyOverlayVisibility();
+  ui.notifications?.info?.('PartyWatch | GM applied a shared view.');
+}
+
+Hooks.once('ready', () => {
+  game.socket.on('module.partywatch', (msg) => {
+    if (!msg) return;
+    if (msg.type === 'applyDefaults' && !game.user.isGM) {
+      applyReceivedPartywatchDefaults(msg.settings);
     }
-  });  
-  
+  });
 });
 
 Hooks.once('ready', () => {
@@ -231,10 +468,20 @@ Hooks.once('ready', () => {
 
   createPartywatchOverlay();
   refreshPartyWatch();
+  applyOverlayVisibility();
 
   Hooks.on('updateActor', refreshPartyWatch);
   Hooks.on('controlToken', refreshPartyWatch);
   Hooks.on('renderPlayerList', refreshPartyWatch);
+  // Scene & token presence hooks for "Only Players In Current Scene"
+  Hooks.on('canvasReady', refreshPartyWatch);
+  Hooks.on('canvasInit', refreshPartyWatch);
+  Hooks.on('canvasTearDown', refreshPartyWatch);
+  Hooks.on('createToken', refreshPartyWatch);
+  Hooks.on('deleteToken', refreshPartyWatch);
+  Hooks.on('updateToken', (_doc, change) => {
+    if ('actorId' in change) refreshPartyWatch();
+  });
 });
 
 Hooks.on("getSceneControlButtons", (controls) => {
@@ -251,45 +498,114 @@ Hooks.on("getSceneControlButtons", (controls) => {
         const overlay = document.getElementById('partywatch-overlay');
         if (!overlay) return;
         if (toggled) {
-          overlay.style.display = '';
-          refreshPartyWatch(); // <- neu aufbauen
-        } else {
-          overlay.style.display = 'none';
+          refreshPartyWatch();
         }
+        applyOverlayVisibility();
       }
     };
   }
 });
 
 
-Hooks.on('updateActor', (actor, data, options, userId) => {
-  handleActorUpdate(actor, data);
+/* ===== HP CHANGE TRACKING & ANIMATIONS =================================
+   Each client keeps its own Map of last-known HP per actor so every viewer
+   (not just the actor's owner) gets damage / heal animations.
+   ===================================================================== */
+const partywatchLastHp = new Map();
+
+Hooks.on('updateActor', (actor) => {
+  if (!actor) return;
+  const { hp: currentHp, max, tempMax } = getActorHp(actor);
+  const effectiveMax = (max || 0) + (tempMax || 0);
+  const prevHp = partywatchLastHp.get(actor.id);
+  partywatchLastHp.set(actor.id, currentHp);
+  if (typeof prevHp !== 'number' || prevHp === currentHp || !effectiveMax) return;
+  // Animate AFTER the entry refresh has rebuilt the DOM. updateActor hooks
+  // fire in registration order; refreshPartyWatch is already registered first
+  // and runs synchronously, so a microtask is enough.
+  Promise.resolve().then(() => animateBarChange(actor, prevHp, currentHp, effectiveMax));
 });
-async function handleActorUpdate(actor, data) {
-  if (!actor.isOwner) return;
 
-  const { hp: currentHp } = getActorHp(actor);
-  const previousHp = actor.getFlag('partywatch', 'lastHp') ?? currentHp;
-  await actor.setFlag('partywatch', 'lastHp', currentHp);
+function findPartywatchEntry(actorId) {
+  const container = document.getElementById('partywatch-overlay');
+  if (!container) return null;
+  return container.querySelector(`.partywatch-entry[data-actor-id="${actorId}"]`);
+}
 
-  const deltaHp = currentHp - previousHp;
+function animateBarChange(actor, prevHp, currentHp, max) {
+  const entry = findPartywatchEntry(actor.id);
+  if (!entry) return;
 
-  if (deltaHp < 0) {
-    const container = document.getElementById('partywatch-overlay');
-    if (!container) return;
+  const damageBar = entry.querySelector('.partywatch-bar-damage');
+  const innerBar = entry.querySelector('.partywatch-bar-inner');
+  const barEl = entry.querySelector('.partywatch-bar');
+  if (!damageBar || !innerBar) return;
 
-    const entry = Array.from(container.querySelectorAll('.partywatch-entry')).find(e => {
-      const name = e.querySelector('.partywatch-name')?.textContent;
-      return name === actor.name;
-    });
+  const wounds = game.settings.get('partywatch', 'wounds');
+  const toPct = v => {
+    let p = Math.clamped(Math.floor((v / (max || 1)) * 100), 0, 100);
+    if (wounds) p = 100 - p;
+    return p;
+  };
+  const prevPct = toPct(prevHp);
+  const newPct  = toPct(currentHp);
+  const isDamage = currentHp < prevHp;
+  const isHeal   = currentHp > prevHp;
 
-    if (!entry) return;
+  // refreshPartyWatch() has already repainted the entry at the new width, so
+  // to actually animate we need to snap back to the OLD width first (no
+  // transition + reflow), then enable the transition and set the new width.
 
+  if (isDamage) {
+    // 1. Inner fill: visibly drop OLD → NEW over a short, punchy ease.
+    innerBar.style.transition = 'none';
+    innerBar.style.width = prevPct + '%';
+    innerBar.style.background = getHPBarColor(prevPct);
+    void innerBar.offsetWidth;
+    innerBar.style.transition = 'width 0.28s cubic-bezier(0.4, 0, 0.2, 1), background 0.35s var(--pw-ease)';
+    innerBar.style.width = newPct + '%';
+    innerBar.style.background = getHPBarColor(newPct);
+    if (barEl) barEl.style.backgroundColor = partywatchDarkenColor(getHPBarColor(newPct), 0.22);
+
+    // 2. Damage buffer: pin at OLD width, hold, then tick down to NEW width.
+    damageBar.style.transition = 'none';
+    damageBar.style.width = prevPct + '%';
+    damageBar.classList.add('is-flashing');
+    void damageBar.offsetWidth;
+    damageBar.style.transition = 'width 0.7s cubic-bezier(0.6, 0, 0.3, 1) 0.4s';
+    damageBar.style.width = newPct + '%';
+
+    setTimeout(() => damageBar.classList.remove('is-flashing'), 1200);
+
+    // Portrait shake + red flash
     const img = entry.querySelector('.partywatch-img');
-    if (!img) return;
+    if (img) {
+      img.classList.add('partywatch-damage-shake');
+      setTimeout(() => img.classList.remove('partywatch-damage-shake'), 600);
+    }
+  } else if (isHeal) {
+    // 1. Heal preview: snap buffer to the FINAL width (green) — player sees the target.
+    damageBar.classList.add('is-healing');
+    damageBar.style.transition = 'none';
+    damageBar.style.width = newPct + '%';
+    void damageBar.offsetWidth;
+    damageBar.style.transition = 'width 0s';
 
-    img.classList.add('partywatch-damage-shake');
-    setTimeout(() => img.classList.remove('partywatch-damage-shake'), 500);
+    // 2. Inner fill: snap back to OLD width with no transition, then slowly
+    //    grow OLD → NEW over ~1.1s with a satisfying eased fill.
+    innerBar.style.transition = 'none';
+    innerBar.style.width = prevPct + '%';
+    innerBar.style.background = getHPBarColor(prevPct);
+    void innerBar.offsetWidth;
+    innerBar.style.transition = 'width 1.1s cubic-bezier(0.22, 1, 0.36, 1), background 0.6s var(--pw-ease)';
+    innerBar.style.width = newPct + '%';
+    innerBar.style.background = getHPBarColor(newPct);
+    if (barEl) barEl.style.backgroundColor = partywatchDarkenColor(getHPBarColor(newPct), 0.22);
+
+    // 3. Restore buffer style after the heal completes.
+    setTimeout(() => damageBar.classList.remove('is-healing'), 1300);
+    entry.classList.add('partywatch-heal-pulse');
+    setTimeout(() => entry.classList.remove('partywatch-heal-pulse'), 1300);
   }
 }
 
@@ -307,20 +623,66 @@ function createPartywatchOverlay() {
 
   dragElement(overlay, dragbar);
 
-  const visible = game.settings.get('partywatch', 'overlayVisible');
-  overlay.style.display = visible ? '' : 'none';
+  applyOverlayVisibility();
 
   document.getElementById('partywatch-cog').addEventListener('click', async () => {
+    const isGM = game.user.isGM;
     const initialSettings = {
       overlayLayout: game.settings.get('partywatch', 'overlayLayout'),
+      barPosition: game.settings.get('partywatch', 'barPosition') ?? 'below',
       nameDisplay: game.settings.get('partywatch', 'nameDisplay'),
+      showPortraits: game.settings.get('partywatch', 'showPortraits'),
       scale: game.settings.get('partywatch', 'scale'),
       hpColorScheme: game.settings.get('partywatch', 'hpColorScheme'),
-      backgroundOpacity: game.settings.get('partywatch', 'backgroundOpacity') ?? 0.5
+      backgroundOpacity: game.settings.get('partywatch', 'backgroundOpacity') ?? 0.5,
+      backgroundColor: game.settings.get('partywatch', 'backgroundColor'),
+      tintMode: game.settings.get('partywatch', 'tintMode'),
+      onlyInScene: game.settings.get('partywatch', 'onlyInScene') ?? false,
+      healthDisplayMode: game.settings.get('partywatch', 'healthDisplayMode') ?? 'numbers',
+      portraitSource: game.settings.get('partywatch', 'portraitSource') ?? 'actor',
+      showOffline: game.settings.get('partywatch', 'showOffline') ?? true,
+      showHealthDetails: game.settings.get('partywatch', 'showHealthDetails') ?? true,
+      wounds: game.settings.get('partywatch', 'wounds') ?? false,
+      enableExtraAttributes: game.settings.get('partywatch', 'enableExtraAttributes') ?? true,
+      extraAttributesGMOnly: game.settings.get('partywatch', 'extraAttributesGMOnly') ?? false
     };
-  
+
     let confirmed = false; // Neu: merken ob gespeichert wurde
-  
+
+    const gmOnlySection = isGM ? `
+        <div style="grid-column: 1 / -1; margin-top: 4px;">
+          <label style="opacity:0.7; font-size:10px;">— GM Only —</label>
+        </div>
+        <div>
+          <label>Show Offline Players:</label>
+          <input type="checkbox" id="pw-showOffline" ${initialSettings.showOffline ? 'checked' : ''}>
+        </div>
+        <div>
+          <label>Show Health Details:</label>
+          <input type="checkbox" id="pw-showHealthDetails" ${initialSettings.showHealthDetails ? 'checked' : ''}>
+        </div>
+        <div>
+          <label>Invert HP (Wounds):</label>
+          <input type="checkbox" id="pw-wounds" ${initialSettings.wounds ? 'checked' : ''}>
+        </div>
+        <div>
+          <label>Enable Extra Attributes:</label>
+          <input type="checkbox" id="pw-enableExtraAttributes" ${initialSettings.enableExtraAttributes ? 'checked' : ''}>
+        </div>
+        <div>
+          <label>Extra Attributes — GM Only:</label>
+          <input type="checkbox" id="pw-extraAttributesGMOnly" ${initialSettings.extraAttributesGMOnly ? 'checked' : ''}>
+        </div>
+        <div class="partywatch-push-row">
+          <label>Apply My View to Players:</label>
+          <button type="button" id="pw-pushDefaults" class="partywatch-push-btn">Push to All</button>
+        </div>
+        <div class="partywatch-push-row">
+          <label>Extra Attributes:</label>
+          <button type="button" id="pw-manageAttrs" class="partywatch-push-btn partywatch-push-btn-alt">Manage Attributes</button>
+        </div>
+    ` : '';
+
     const content = `
       <div class="partywatch-settings">
         <div>
@@ -331,23 +693,45 @@ function createPartywatchOverlay() {
           </select>
         </div>
         <div>
-          <label>Show Names:</label>
-          <input type="checkbox" id="pw-nameDisplay" ${initialSettings.nameDisplay ? 'checked' : ''}>
-        </div>
-        <div>
-          <label>Show Portraits:</label>
-          <input type="checkbox" id="pw-showPortraits" ${game.settings.get('partywatch', 'showPortraits') ? 'checked' : ''}>
-        </div>
-        <div>
-          <label>Scale:</label>
-          <input type="range" id="pw-scale" min="0.5" max="2" step="0.1" value="${initialSettings.scale}">
+          <label>HP Bar Position:</label>
+          <select id="pw-barPosition">
+            <option value="below"   ${initialSettings.barPosition === 'below'   ? 'selected' : ''}>Below Portrait</option>
+            <option value="overlay" ${initialSettings.barPosition === 'overlay' ? 'selected' : ''}>Overlay on Portrait</option>
+          </select>
         </div>
         <div>
           <label>HP Bar Color:</label>
           <select id="pw-hpColor">
+            <option value="dynamic" ${initialSettings.hpColorScheme === 'dynamic' ? 'selected' : ''}>Dynamic (Red / Yellow / Green)</option>
             <option value="static" ${initialSettings.hpColorScheme === 'static' ? 'selected' : ''}>Static Green</option>
-            <option value="dynamic" ${initialSettings.hpColorScheme === 'dynamic' ? 'selected' : ''}>Dynamic (Green/Yellow/Red)</option>
+            <option value="staticRed" ${initialSettings.hpColorScheme === 'staticRed' ? 'selected' : ''}>Static Red</option>
           </select>
+        </div>
+        <div>
+          <label>Health Display Mode:</label>
+          <select id="pw-healthDisplayMode">
+            <option value="numbers" ${initialSettings.healthDisplayMode === 'numbers' ? 'selected' : ''}>Numbers (9/12)</option>
+            <option value="estimate" ${initialSettings.healthDisplayMode === 'estimate' ? 'selected' : ''}>Estimate (Injured…)</option>
+          </select>
+        </div>
+        <div>
+          <label>Portrait Source:</label>
+          <select id="pw-portraitSource">
+            <option value="actor" ${initialSettings.portraitSource === 'actor' ? 'selected' : ''}>Actor Portrait</option>
+            <option value="token" ${initialSettings.portraitSource === 'token' ? 'selected' : ''}>Token Image</option>
+          </select>
+        </div>
+        <div>
+          <label>Portrait Tint Mode:</label>
+          <select id="pw-tintMode">
+            <option value="none" ${initialSettings.tintMode === 'none' ? 'selected' : ''}>No Tint</option>
+            <option value="darken" ${initialSettings.tintMode === 'darken' ? 'selected' : ''}>Darken on Low Health</option>
+            <option value="color" ${initialSettings.tintMode === 'color' ? 'selected' : ''}>Colorize by Health</option>
+          </select>
+        </div>
+        <div>
+          <label>Scale:</label>
+          <input type="range" id="pw-scale" min="0.5" max="2" step="0.1" value="${initialSettings.scale}">
         </div>
         <div>
           <label>Background Transparency:</label>
@@ -355,16 +739,21 @@ function createPartywatchOverlay() {
         </div>
         <div>
           <label>Background Color:</label>
-          <input type="color" id="pw-backgroundColor" value="${game.settings.get('partywatch', 'backgroundColor')}">
+          <input type="color" id="pw-backgroundColor" value="${initialSettings.backgroundColor}">
         </div>
         <div>
-          <label>Portrait Tint Mode:</label>
-          <select id="pw-tintMode">
-            <option value="none" ${game.settings.get('partywatch', 'tintMode') === 'none' ? 'selected' : ''}>No Tint</option>
-            <option value="darken" ${game.settings.get('partywatch', 'tintMode') === 'darken' ? 'selected' : ''}>Darken on Low Health</option>
-            <option value="color" ${game.settings.get('partywatch', 'tintMode') === 'color' ? 'selected' : ''}>Colorize by Health</option>
-          </select>
+          <label>Show Names:</label>
+          <input type="checkbox" id="pw-nameDisplay" ${initialSettings.nameDisplay ? 'checked' : ''}>
         </div>
+        <div>
+          <label>Show Portraits:</label>
+          <input type="checkbox" id="pw-showPortraits" ${initialSettings.showPortraits ? 'checked' : ''}>
+        </div>
+        <div>
+          <label>Only Show When In Scene:</label>
+          <input type="checkbox" id="pw-onlyInScene" ${initialSettings.onlyInScene ? 'checked' : ''}>
+        </div>
+        ${gmOnlySection}
       </div>
     `;
   
@@ -392,7 +781,7 @@ function createPartywatchOverlay() {
           resetSettings(); // Nur zurücksetzen wenn nicht gespeichert
         }
       }
-    });
+    }, { classes: ['dialog', 'partywatch-dialog'] });
   
     dialog.render(true);
   
@@ -400,6 +789,10 @@ function createPartywatchOverlay() {
       html.find('#pw-layout').on('change', e => {
         game.settings.set('partywatch', 'overlayLayout', e.target.value);
         updateOverlayLayout();
+        refreshPartyWatch();
+      });
+      html.find('#pw-barPosition').on('change', e => {
+        game.settings.set('partywatch', 'barPosition', e.target.value);
         refreshPartyWatch();
       });
       html.find('#pw-nameDisplay').on('change', e => {
@@ -419,10 +812,6 @@ function createPartywatchOverlay() {
         game.settings.set('partywatch', 'backgroundOpacity', parseFloat(e.target.value));
         updateOverlayBackground();
       });
-      html.find('#pw-tintPortrait').on('change', e => {
-        game.settings.set('partywatch', 'tintPortrait', e.target.checked);
-        refreshPartyWatch();
-      });
       html.find('#pw-tintMode').on('change', e => {
         game.settings.set('partywatch', 'tintMode', e.target.value);
         refreshPartyWatch();
@@ -435,18 +824,72 @@ function createPartywatchOverlay() {
         game.settings.set('partywatch', 'backgroundColor', e.target.value);
         updateOverlayBackground();
       });
+      html.find('#pw-onlyInScene').on('change', e => {
+        game.settings.set('partywatch', 'onlyInScene', e.target.checked);
+        refreshPartyWatch();
+      });
+      html.find('#pw-healthDisplayMode').on('change', e => {
+        game.settings.set('partywatch', 'healthDisplayMode', e.target.value);
+        refreshPartyWatch();
+      });
+      html.find('#pw-portraitSource').on('change', e => {
+        game.settings.set('partywatch', 'portraitSource', e.target.value);
+        refreshPartyWatch();
+      });
+      // GM-only fields
+      html.find('#pw-showOffline').on('change', e => {
+        game.settings.set('partywatch', 'showOffline', e.target.checked);
+        refreshPartyWatch();
+      });
+      html.find('#pw-showHealthDetails').on('change', e => {
+        game.settings.set('partywatch', 'showHealthDetails', e.target.checked);
+        refreshPartyWatch();
+      });
+      html.find('#pw-wounds').on('change', e => {
+        game.settings.set('partywatch', 'wounds', e.target.checked);
+        refreshPartyWatch();
+      });
+      html.find('#pw-enableExtraAttributes').on('change', e => {
+        game.settings.set('partywatch', 'enableExtraAttributes', e.target.checked);
+        refreshPartyWatch();
+      });
+      html.find('#pw-extraAttributesGMOnly').on('change', e => {
+        game.settings.set('partywatch', 'extraAttributesGMOnly', e.target.checked);
+        refreshPartyWatch();
+      });
+      html.find('#pw-pushDefaults').on('click', async () => {
+        await pushPartywatchDefaultsToPlayers();
+      });
+      html.find('#pw-manageAttrs').on('click', () => {
+        openPartywatchAttributeEditor();
+      });
     });
-  
+
     async function resetSettings() {
       await game.settings.set('partywatch', 'overlayLayout', initialSettings.overlayLayout);
+      await game.settings.set('partywatch', 'barPosition', initialSettings.barPosition);
       await game.settings.set('partywatch', 'nameDisplay', initialSettings.nameDisplay);
+      await game.settings.set('partywatch', 'showPortraits', initialSettings.showPortraits);
       await game.settings.set('partywatch', 'scale', initialSettings.scale);
       await game.settings.set('partywatch', 'hpColorScheme', initialSettings.hpColorScheme);
       await game.settings.set('partywatch', 'backgroundOpacity', initialSettings.backgroundOpacity);
+      await game.settings.set('partywatch', 'backgroundColor', initialSettings.backgroundColor);
+      await game.settings.set('partywatch', 'tintMode', initialSettings.tintMode);
+      await game.settings.set('partywatch', 'onlyInScene', initialSettings.onlyInScene);
+      await game.settings.set('partywatch', 'healthDisplayMode', initialSettings.healthDisplayMode);
+      await game.settings.set('partywatch', 'portraitSource', initialSettings.portraitSource);
+      if (isGM) {
+        await game.settings.set('partywatch', 'showOffline', initialSettings.showOffline);
+        await game.settings.set('partywatch', 'showHealthDetails', initialSettings.showHealthDetails);
+        await game.settings.set('partywatch', 'wounds', initialSettings.wounds);
+        await game.settings.set('partywatch', 'enableExtraAttributes', initialSettings.enableExtraAttributes);
+        await game.settings.set('partywatch', 'extraAttributesGMOnly', initialSettings.extraAttributesGMOnly);
+      }
       refreshPartyWatch();
       updateOverlayLayout();
       updateOverlayScale();
       updateOverlayBackground();
+      applyOverlayVisibility();
     }
   });
 
@@ -469,7 +912,7 @@ async function refreshPartyWatch() {
   const layout = game.settings.get('partywatch', 'overlayLayout') || 'flex';
   container.style.display = layout;
 
-  container.querySelectorAll('.partywatch-entry').forEach(e => e.remove());
+  container.querySelectorAll('.partywatch-entry, .partywatch-group, .partywatch-empty-info').forEach(e => e.remove());
 
   const showOffline = game.settings.get("partywatch", "showOffline");
   const showHealthDetails = game.settings.get('partywatch', 'showHealthDetails');
@@ -477,93 +920,151 @@ async function refreshPartyWatch() {
   const portraitSource = game.settings.get('partywatch', 'portraitSource') || 'actor';
   const tintPortrait = game.settings.get('partywatch', 'tintPortrait');
   const tintMode = game.settings.get('partywatch', 'tintMode') || 'none';
-  const players = game.users.players.filter(u => (u.active || showOffline) && u.character);
+  const onlyInScene = game.settings.get('partywatch', 'onlyInScene') ?? false;
+
+  const sceneActorIds = onlyInScene && canvas?.scene
+    ? new Set(canvas.scene.tokens.map(t => t.actorId).filter(Boolean))
+    : null;
+
+  const players = game.users.players.filter(u => {
+    if (!u.character) return false;
+    if (!u.active && !showOffline) return false;
+    if (onlyInScene) {
+      if (!sceneActorIds || !sceneActorIds.has(u.character.id)) return false;
+    }
+    return true;
+  });
+
+  // Wipe previous groups (and any stray entries from older renders).
+  container.querySelectorAll('.partywatch-group').forEach(e => e.remove());
+
+  const barPosition = game.settings.get('partywatch', 'barPosition') || 'below';
+  const barOnPortrait = barPosition === 'overlay' && showPortraits;
+  const companionType = (game.settings.get('partywatch', 'companionActorType') || '').trim();
+
+  // Builds one .partywatch-entry element for the given actor.
+  function buildEntry(actor, { isCompanion = false } = {}) {
+    const { hp: currentHp, max: maxHp, temp: tempHp, tempMax: tempMaxHp } = getActorHp(actor);
+    const effectiveMax = (maxHp || 0) + (tempMaxHp || 0);
+
+    if (!partywatchLastHp.has(actor.id) && typeof currentHp === 'number') {
+      partywatchLastHp.set(actor.id, currentHp);
+    }
+
+    let barPercent = effectiveMax > 0
+      ? Math.clamped(Math.floor((currentHp / effectiveMax) * 100), 0, 100)
+      : 0;
+    if (game.settings.get('partywatch', 'wounds')) barPercent = 100 - barPercent;
+    const tempPercent = effectiveMax > 0
+      ? Math.clamped(Math.floor((tempHp / effectiveMax) * 100), 0, 100)
+      : 0;
+    const hpPercent = Math.clamped(Math.floor((currentHp / (maxHp || 1)) * 100), 0, 100);
+    const imgSrc = portraitSource === 'token'
+      ? (actor.prototypeToken?.texture?.src || actor.img)
+      : actor.img;
+
+    let healthText = '';
+    if (showHealthDetails && !isCompanion) {
+      if (healthDisplayMode === 'numbers') {
+        const totalMax = (maxHp || 0) + (tempMaxHp || 0);
+        healthText = `${currentHp}/${totalMax}`;
+        if (tempHp > 0) healthText += ` <span class="partywatch-temp-suffix">+${tempHp}</span>`;
+      } else if (healthDisplayMode === 'estimate') {
+        healthText = getHealthEstimate(hpPercent);
+        if (tempHp > 0) healthText += ` <span class="partywatch-temp-suffix">+${tempHp}</span>`;
+      }
+    }
+
+    const barRowHTML = `
+      <div class="partywatch-bar-row">
+        ${healthText ? `<div class="partywatch-hp-text">${healthText}</div>` : ''}
+        <div class="partywatch-bar" style="background-color: ${partywatchDarkenColor(getHPBarColor(barPercent), 0.22)};">
+          <div class="partywatch-bar-damage" style="width: ${barPercent}%;"></div>
+          <div class="partywatch-bar-inner" style="width: ${barPercent}%; background: ${getHPBarColor(barPercent)};"></div>
+          ${tempPercent > 0 ? `<div class="partywatch-bar-temp" style="left: 0; width: ${tempPercent}%;"></div>` : ''}
+        </div>
+      </div>
+    `;
+
+    const extraAttrsHTML = isCompanion ? '' : buildExtraAttributesHTML(actor);
+
+    const entryEl = document.createElement('div');
+    entryEl.className = 'partywatch-entry'
+      + (barOnPortrait ? ' partywatch-bar-on-portrait' : '')
+      + (isCompanion ? ' partywatch-companion' : '');
+    entryEl.dataset.actorId = actor.id;
+    entryEl.dataset.name = actor.name;
+    entryEl.innerHTML = `
+      ${showPortraits ? `
+        <div class="partywatch-img-wrapper">
+          ${generateOverlay(hpPercent, tintMode)}
+          <img src="${imgSrc}" alt="${actor.name}" class="partywatch-img">
+          ${barOnPortrait ? barRowHTML : ''}
+        </div>
+      ` : ''}
+      ${!barOnPortrait ? barRowHTML : ''}
+      ${extraAttrsHTML}
+      ${game.settings.get('partywatch', 'nameDisplay') && !isCompanion ? `<div class="partywatch-name">${actor.name}</div>` : ''}
+    `;
+    entryEl.addEventListener('click', event => {
+      if (event.button === 0) {
+        const token = canvas.tokens.placeables.find(t => t.actor && t.actor.id === actor.id);
+        if (token) {
+          canvas.animatePan({ x: token.x + token.w / 2, y: token.y + token.h / 2, scale: canvas.stage.scale.x });
+          if (game.user.isGM) token.control({ releaseOthers: true });
+        }
+      }
+    });
+    entryEl.addEventListener('contextmenu', event => {
+      event.preventDefault();
+      if (game.user.isGM || actor.isOwner) actor.sheet.render(true);
+    });
+    return entryEl;
+  }
+
+  // Find on-scene companions (actors of the configured companion type that
+  // the given player owns) — dedupe by actor id since one actor can have
+  // multiple tokens on a scene.
+  function findCompanionsForPlayer(player) {
+    if (!companionType) return [];
+    if (!canvas?.scene) return [];
+    const out = [];
+    const seen = new Set();
+    for (const tokenDoc of canvas.scene.tokens) {
+      const compActor = tokenDoc.actor;
+      if (!compActor) continue;
+      if (compActor.id === player.character?.id) continue;
+      if (seen.has(compActor.id)) continue;
+      if (compActor.type !== companionType) continue;
+      if (!compActor.testUserPermission(player, 'OWNER')) continue;
+      seen.add(compActor.id);
+      out.push(compActor);
+    }
+    return out;
+  }
 
   for (const player of players) {
     const actor = player.character;
     if (!actor) continue;
 
-    const barPercent = getBarPercent(actor);
-    const { hp: currentHp, max: maxHp } = getActorHp(actor);
-    
-    const hpPercent = Math.clamped(Math.floor((currentHp / (maxHp || 1)) * 100), 0, 100);
-    const imgSrc = portraitSource === 'token' 
-    ? (actor.prototypeToken.texture?.src || actor.img) 
-    : actor.img;
-  
-    let tintStyle = '';
-    if (tintMode === 'darken') {
-      if (hpPercent >= 70) {
-        tintStyle = ''; // 90–100% HP → kein Filter
-      } else {
-        const normalized = Math.clamped((90 - hpPercent) / 90, 0, 1); // erst ab <90% starten
-        const brightness = Math.max(0.2, 1 - (normalized ** 2)); // quadratische Kurve: langsamer Start, schneller Abfall
-        tintStyle = `style="filter: brightness(${brightness.toFixed(2)}); transition: filter 0.3s;"`;
+    const group = document.createElement('div');
+    group.className = 'partywatch-group';
+    group.appendChild(buildEntry(actor));
+
+    const companions = findCompanionsForPlayer(player);
+    if (companions.length) {
+      const compContainer = document.createElement('div');
+      compContainer.className = 'partywatch-companions';
+      for (const compActor of companions) {
+        compContainer.appendChild(buildEntry(compActor, { isCompanion: true }));
       }
-    }
-    else if (tintMode === 'color') {
-      if (hpPercent >= 95) {
-        tintStyle = ''; // 95–100% HP → kein Filter
-      } else {
-        let hue = 200; // Start Grün
-        if (hpPercent <= 25) hue = -10;      // Rot
-        else if (hpPercent <= 50) hue = 30; // Orange
-        else if (hpPercent <= 75) hue = 60; // Gelb
-    
-        tintStyle = `style="filter: sepia(1) saturate(5) hue-rotate(${hue}deg); transition: filter 0.3s;"`;
-      }
-    }
-    
-    
-    let healthText = '';
-    if (showHealthDetails) {
-      if (healthDisplayMode === 'numbers') {
-        healthText = `${currentHp}/${maxHp}`;
-      } else if (healthDisplayMode === 'estimate') {
-        healthText = getHealthEstimate(hpPercent);
-      }
+      group.appendChild(compContainer);
     }
 
-    const entry = document.createElement('div');
-    entry.className = 'partywatch-entry';
-    entry.innerHTML = `
-
-      ${showPortraits ? `
-        <div class="partywatch-img-wrapper">
-          ${generateOverlay(hpPercent, tintMode)}
-          <img src="${imgSrc}" alt="${actor.name}" class="partywatch-img">
-        </div>
-      ` : ''}
-      <div class="partywatch-bar">
-        <div class="partywatch-bar-inner" style="width: ${barPercent}%; background: ${getHPBarColor(barPercent)};"></div>
-        ${healthText ? `<div class="partywatch-hp-text">${healthText}</div>` : ''}
-      </div>
-      ${game.settings.get('partywatch', 'nameDisplay') ? `<div class="partywatch-name">${actor.name}</div>` : ''}
-    `;
-    entry.addEventListener('click', event => {
-      if (event.button === 0) { // Linksklick
-        const token = canvas.tokens.placeables.find(t => t.actor && t.actor.id === actor.id);
-        if (token) {
-          canvas.animatePan({ 
-            x: token.x + token.w / 2, 
-            y: token.y + token.h / 2, 
-            scale: canvas.stage.scale.x // keine Zoomänderung
-          });
-          if(user.isGM)
-            token.control({ releaseOthers: true });
-        }
-      }
-    });
-    entry.addEventListener('contextmenu', event => { // Rechtsklick
-      event.preventDefault();
-      if (game.user.isGM || actor.isOwner) {
-        actor.sheet.render(true);
-      }
-    });
-    container.appendChild(entry);
+    container.appendChild(group);
   }
   if (container.querySelectorAll('.partywatch-entry').length === 0) {
-    container.querySelectorAll('.partywatch-entry, .partywatch-empty-info').forEach(e => e.remove());
+    container.querySelectorAll('.partywatch-group, .partywatch-empty-info').forEach(e => e.remove());
     const emptyInfo = document.createElement('div');
     emptyInfo.className = 'partywatch-empty-info';
     emptyInfo.innerHTML = `
@@ -622,10 +1123,86 @@ function dragElement(elmnt, dragHandle) {
 function getHPBarColor(percent) {
   const scheme = game.settings.get('partywatch', 'hpColorScheme');
   if (scheme === 'static') return '#00aa00';
+  if (scheme === 'staticRed') return '#c2241a';
   if (percent <= 25) return '#aa0000'; // rot
   if (percent <= 50) return '#ffaa00'; // orange
   if (percent <= 75) return '#aaaa00'; // gelb
   return '#00aa00'; // grün
+}
+
+function partywatchDarkenColor(color, factor = 0.22) {
+  // Accepts #rgb, #rrggbb, or rgb(r,g,b); returns rgb() string at `factor` brightness.
+  let r = 0, g = 0, b = 0;
+  if (typeof color !== 'string') return `rgb(0,0,0)`;
+  const hex = color.trim().replace(/^#/, '');
+  if (hex.length === 3) {
+    r = parseInt(hex[0] + hex[0], 16);
+    g = parseInt(hex[1] + hex[1], 16);
+    b = parseInt(hex[2] + hex[2], 16);
+  } else if (hex.length === 6) {
+    r = parseInt(hex.slice(0, 2), 16);
+    g = parseInt(hex.slice(2, 4), 16);
+    b = parseInt(hex.slice(4, 6), 16);
+  } else {
+    const m = color.match(/\d+/g);
+    if (m && m.length >= 3) { r = +m[0]; g = +m[1]; b = +m[2]; }
+  }
+  const f = Math.max(0, Math.min(1, factor));
+  return `rgb(${Math.round(r * f)}, ${Math.round(g * f)}, ${Math.round(b * f)})`;
+}
+
+/* ===== EXTRA ATTRIBUTES =================================================
+   User-defined extra attribute readouts (AC, Passive Perception, mana, etc).
+   Shown as a row of compact badges/bars under each main entry.
+   ====================================================================== */
+function partywatchGetAttributes() {
+  const raw = game.settings.get('partywatch', 'extraAttributes');
+  if (!raw) return [];
+  if (typeof raw === 'string') {
+    try { return JSON.parse(raw) || []; } catch (e) { return []; }
+  }
+  return Array.isArray(raw) ? raw : [];
+}
+
+function buildExtraAttributesHTML(actor) {
+  if (!game.settings.get('partywatch', 'enableExtraAttributes')) return '';
+  if (game.settings.get('partywatch', 'extraAttributesGMOnly') && !game.user.isGM) return '';
+  const attrs = partywatchGetAttributes();
+  if (!attrs.length) return '';
+
+  const parts = [];
+  for (const a of attrs) {
+    if (!a || !a.currentPath) continue;
+    const value = partywatchGetProperty(actor, a.currentPath);
+    if (value === undefined || value === null) continue;
+    const max = a.maxPath ? partywatchGetProperty(actor, a.maxPath) : null;
+    const color = a.color || '#cbd5e1';
+    const label = a.label || '';
+    const iconHTML = a.icon ? `<i class="fas fa-${a.icon}"></i>` : '';
+    const valueStr = max != null ? `${value}/${max}` : String(value);
+
+    if (a.type === 'bar' && max != null && max > 0) {
+      const pct = Math.max(0, Math.min(100, (Number(value) / Number(max)) * 100));
+      parts.push(`
+        <div class="partywatch-attr partywatch-attr-bar" title="${label}: ${valueStr}" style="--attr-color: ${color}; --attr-bg: ${partywatchDarkenColor(color, 0.22)};">
+          ${iconHTML ? `<span class="partywatch-attr-icon">${iconHTML}</span>` : ''}
+          <div class="partywatch-attr-bartrack"><div class="partywatch-attr-barfill" style="width: ${pct}%;"></div></div>
+        </div>`);
+    } else if (a.type === 'number') {
+      parts.push(`
+        <div class="partywatch-attr partywatch-attr-number" title="${label}: ${valueStr}" style="--attr-color: ${color};">
+          ${iconHTML}<span class="partywatch-attr-value">${valueStr}</span>
+        </div>`);
+    } else {
+      // default: 'badge' — icon pill + number
+      parts.push(`
+        <div class="partywatch-attr partywatch-attr-badge" title="${label}: ${valueStr}" style="--attr-color: ${color};">
+          ${iconHTML}<span class="partywatch-attr-value">${valueStr}</span>
+        </div>`);
+    }
+  }
+  if (!parts.length) return '';
+  return `<div class="partywatch-attrs">${parts.join('')}</div>`;
 }
 
 function updateOverlayPosition() {
@@ -654,7 +1231,11 @@ function updateOverlayBackground() {
   if (!container) return;
   const opacity = game.settings.get('partywatch', 'backgroundOpacity') ?? 0.5;
   const color = game.settings.get('partywatch', 'backgroundColor') ?? '#000000';
-  container.style.background = hexToRgba(color, opacity);
+  const bg = hexToRgba(color, opacity);
+  container.style.background = bg;
+  // Publish the same bg via a CSS variable so satellite panels (companions)
+  // can mirror it without JS having to re-apply each one.
+  container.style.setProperty('--partywatch-bg', bg);
 }
 function hexToRgba(hex, alpha) {
   const bigint = parseInt(hex.replace('#', ''), 16);
@@ -693,10 +1274,11 @@ function generateOverlay(hpPercent, tintMode) {
 }
 
 function getBarPercent(actor) {
-  const { hp, max } = getActorHp(actor);
-  if (typeof hp !== 'number' || typeof max !== 'number' || max <= 0) return 0;
+  const { hp, max, tempMax } = getActorHp(actor);
+  const effectiveMax = (max || 0) + (tempMax || 0);
+  if (typeof hp !== 'number' || effectiveMax <= 0) return 0;
 
-  let percent = Math.clamped(Math.floor((hp / max) * 100), 0, 100);
+  let percent = Math.clamped(Math.floor((hp / effectiveMax) * 100), 0, 100);
   if (game.settings.get('partywatch', 'wounds')) percent = 100 - percent;
   return percent;
 }
@@ -705,7 +1287,11 @@ function getBarPercent(actor) {
 function getActorHp(actor) {
   const hp = partywatchGetProperty(actor, game.settings.get('partywatch', 'hpPath')) ?? 0;
   const max = partywatchGetProperty(actor, game.settings.get('partywatch', 'maxhpPath')) ?? 1;
-  return { hp, max };
+  const tempPath = game.settings.get('partywatch', 'tempHpPath');
+  const tempMaxPath = game.settings.get('partywatch', 'tempMaxHpPath');
+  const temp = tempPath ? (Number(partywatchGetProperty(actor, tempPath)) || 0) : 0;
+  const tempMax = tempMaxPath ? (Number(partywatchGetProperty(actor, tempMaxPath)) || 0) : 0;
+  return { hp, max, temp, tempMax };
 }
 
 //SETUP

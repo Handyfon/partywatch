@@ -2,7 +2,7 @@
   "id": "partywatch",
   "title": "Party Watch",
   "description": "A lightweight HUD showing your party's health, conditions, and status at a glance. Clean, fast, and always ready.",
-  "version": "14.1",
+  "version": "14.2",
   "esmodules": [
     "partywatch.js"
   ],
@@ -11,9 +11,9 @@
       "src": "partywatch.css"
     }
   ],
-  "url": "https://github.com/Handyfon/partywatch/tree/master",
-  "manifest": "https://raw.githubusercontent.com/Handyfon/partywatch/master/module.json",
-  "download": "https://github.com/Handyfon/partywatch/raw/main/partywatch.zip",
+  "url": "https://github.com/Handyfon/partywatch",
+  "manifest": "https://raw.githubusercontent.com/Handyfon/partywatch/main/module.json",
+  "download": "https://github.com/Handyfon/partywatch/releases/download/v14.2/partywatch.zip",
   "authors": [
     {
       "name": "Handyfon",
